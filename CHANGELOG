@@ -1,6 +1,19 @@
 CONTRIBUTIONS & CHANGE HISTORY
 ==============================
 
+21-09-2018  - v4.4.2
+             * Fix for #163 - default to using IPv4
+
+23-08-2018  - v4.4.1
+             * Fixes to TLS socket handling (PR#163)
+             * Fix ipv6 address family handling (PR#155)
+             * Don't send messages to closed/inactive connections (PR#152)
+
+28-01-2017 - v4.4
+             * Fixes to SOCKS over SSL processing
+             * Added stream_full_chunks option
+             * Merged pull requests 145, 151
+
 07-06-2016 - v4.3
              * Adopted erlang.mk for compiling. I find it easier to understand
                how 'make' behaves compared to rebar. This repo can still be built

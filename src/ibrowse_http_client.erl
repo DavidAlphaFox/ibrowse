@@ -61,6 +61,7 @@
                   stream_to, caller_controls_socket = false,
                   caller_socket_options = [],
                   req_id,
+                  stream_full_chunks = false,
                   stream_chunk_size,
                   save_response_to_file = false,
                   tmp_file_name, tmp_file_fd, preserve_chunked_encoding,
@@ -173,7 +174,7 @@ handle_call({send_req, _}, _From, #state{is_closing = true} = State) ->
     {reply, {error, connection_closing}, State};
 
 handle_call({send_req, _}, _From, #state{proc_state = ?dead_proc_walking} = State) ->
-    shutting_down(State),    
+    shutting_down(State),
     {reply, {error, connection_closing}, State};
 
 handle_call({send_req, {Url, Headers, Method, Body, Options, Timeout}},
@@ -570,7 +571,28 @@ do_connect(Host, Port, Options, #state{is_ssl      = true,
                                        use_proxy   = false,
                                        ssl_options = SSLOptions},
            Timeout) ->
-    ssl:connect(Host, Port, get_sock_options(Host, Options, SSLOptions), Timeout);
+    %% if a socks5 proxy is configured, open the socket separately
+    %% before upgrading the socket to a TLS connection.
+    case get_value(socks5_host, Options, undefined) of
+        %% no socks5 proxy is configured, connect directly with TLS:
+        undefined ->
+            Sock_options = get_sock_options(Host, Options, SSLOptions),
+            ssl:connect(Host, Port, Sock_options, Timeout);
+
+        %% proxy configuration is present: first establish a socket
+        %% and then upgrade:
+        _ ->
+            Sock_options = get_sock_options(Host, Options, []),
+            Conn = ibrowse_socks5:connect(Host, Port, Options,
+                                          Sock_options, Timeout),
+            case Conn of
+                {ok, Sock} ->
+                    ssl:connect(Sock, SSLOptions, Timeout);
+                _ ->
+                    error
+            end
+    end;
+
 do_connect(Host, Port, Options, _State, Timeout) ->
     Socks5Host = get_value(socks5_host, Options, undefined),
     Sock_options = get_sock_options(Host, Options, []),
@@ -583,12 +605,18 @@ do_connect(Host, Port, Options, _State, Timeout) ->
 
 get_sock_options(Host, Options, SSLOptions) ->
     Caller_socket_options = get_value(socket_options, Options, []),
-    Ipv6Options = case is_ipv6_host(Host) of
-        true ->
-            [inet6];
-        false ->
-            []
-    end,
+    PreferIPv6 = get_value(prefer_ipv6, Options, false),
+    Ipv6Options = case PreferIPv6 of
+                      true ->
+                          case is_ipv6_host(Host) of
+                              true ->
+                                  [inet6];
+                              false ->
+                                  []
+                          end;
+                      false ->
+                          []
+                  end,
     Other_sock_options = filter_sock_options(SSLOptions ++ Caller_socket_options ++ Ipv6Options),
     case lists:keysearch(nodelay, 1, Other_sock_options) of
         false ->
@@ -604,7 +632,7 @@ is_ipv6_host(Host) ->
         {ok, {_, _, _, _}} ->
             false;
         _  ->
-            case inet:gethostbyname(Host) of
+            case inet:gethostbyname(Host, inet6) of
                 {ok, #hostent{h_addrtype = inet6}} ->
                     true;
                 _ ->
@@ -895,6 +923,7 @@ send_req_1(From,
                       options                = Options,
                       req_id                 = ReqId,
                       save_response_to_file  = SaveResponseToFile,
+                      stream_full_chunks     = get_value(stream_full_chunks, Options, false),
                       stream_chunk_size      = get_stream_chunk_size(Options),
                       response_format        = Resp_format,
                       from                   = From,
@@ -1437,22 +1466,41 @@ parse_11_response(DataRecvd,
                   #state{transfer_encoding = chunked,
                          chunk_size = CSz,
                          recvd_chunk_size = Recvd_csz,
-                         rep_buf_size = RepBufSz} = State) ->
+                         reply_buffer = RepBuf,
+                         rep_buf_size = RepBufSz,
+                         streamed_size = Streamed_size,
+                         cur_req = CurReq} = State) ->
     NeedBytes = CSz - Recvd_csz,
     DataLen = size(DataRecvd),
     do_trace("Recvd more data: size: ~p. NeedBytes: ~p~n", [DataLen, NeedBytes]),
     case DataLen >= NeedBytes of
         true ->
             {RemChunk, RemData} = split_binary(DataRecvd, NeedBytes),
-            do_trace("Recvd another chunk...~p~n", [RemChunk]),
-            do_trace("RemData -> ~p~n", [RemData]),
-            case accumulate_response(RemChunk, State) of
-                {error, Reason} ->
-                    do_trace("Error accumulating response --> ~p~n", [Reason]),
-                    {error, Reason};
-                #state{} = State_1 ->
-                    State_2 = State_1#state{chunk_size=tbd},
-                    parse_11_response(RemData, State_2)
+            case CurReq of
+                #request{stream_to = StreamTo, caller_controls_socket = false, req_id = ReqId, stream_full_chunks = true, response_format = Response_format} ->
+                    Chunk = <<RepBuf/binary, RemChunk/binary>>,
+                    do_trace("Recvd another chunk...~p~n", [Chunk]),
+                    do_trace("RemData -> ~p~n", [RemData]),
+                    do_interim_reply(StreamTo, Response_format, ReqId, Chunk),
+                    State_1 = State#state{
+                                reply_buffer = <<>>,
+                                rep_buf_size = RepBufSz + size(RemChunk),
+                                interim_reply_sent = true,
+                                streamed_size = Streamed_size + CSz,
+                                chunk_size = tbd,
+                                recvd_chunk_size = 0},
+                    parse_11_response(RemData, State_1);
+                _ ->
+                    do_trace("Recvd another chunk...~p~n", [RemChunk]),
+                    do_trace("RemData -> ~p~n", [RemData]),
+                    case accumulate_response(RemChunk, State) of
+                        {error, Reason} ->
+                            do_trace("Error accumulating response --> ~p~n", [Reason]),
+                            {error, Reason};
+                        #state{} = State_1 ->
+                            State_2 = State_1#state{chunk_size=tbd},
+                            parse_11_response(RemData, State_2)
+                    end
             end;
         false ->
             accumulate_response(DataRecvd,
@@ -1881,6 +1929,11 @@ format_response_data(Resp_format, Body) ->
             Body
     end.
 
+%% dont message an unexisting server
+%% triggered by :stop or :tcp_closed on an unactive connection
+do_reply(State, undefined, undefined, _, _, _Msg) ->
+    dec_pipeline_counter(State);
+
 do_reply(State, From, undefined, _, Resp_format, {ok, St_code, Headers, Body}) ->
     Msg_1 = {ok, St_code, Headers, format_response_data(Resp_format, Body)},
     gen_server:reply(From, Msg_1),
@@ -2051,11 +2104,16 @@ flatten([]) ->
     [].
 
 get_stream_chunk_size(Options) ->
-    case lists:keysearch(stream_chunk_size, 1, Options) of
-        {value, {_, V}} when V > 0 ->
-            V;
+    case get_value(stream_full_chunks, Options, false) of
+        true ->
+            infinity;
         _ ->
-            ?DEFAULT_STREAM_CHUNK_SIZE
+            case lists:keysearch(stream_chunk_size, 1, Options) of
+                {value, {_, V}} when V > 0 ->
+                    V;
+                _ ->
+                    ?DEFAULT_STREAM_CHUNK_SIZE
+            end
     end.
 
 set_inac_timer(State) ->
